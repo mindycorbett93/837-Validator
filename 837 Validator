@@ -1,0 +1,37 @@
+import requests
+
+def verify_and_scrub_837(claim_data, master_enrollment):
+    issues = []
+    npi = claim_data.get('rendering_provider_npi')
+    
+    # 1. NPPES API Validation
+    nppes_url = f"https://npiregistry.cms.hhs.gov/api/?number={npi}&version=2.1"
+    response = requests.get(nppes_url)
+    nppes_data = response.json()
+    
+    if nppes_data.get('result_count', 0) == 0:
+        issues.append(f"CRITICAL: NPI {npi} not found in NPPES Registry.")
+    elif nppes_data['results'][0]['basic']['status'] != 'A':
+        issues.append(f"CRITICAL: NPI {npi} is inactive in NPPES.")
+
+    # 2. Frequently Denied CPT Check (New Logic)
+    # Mapping frequent denial patterns (e.g., E/M levels without modifiers)
+    denial_watch_list = {
+        '99214': {'required_modifier': '25', 'reason': 'High audit risk for unbundled services'},
+        '99215': {'required_modifier': '25', 'reason': 'Frequent medical necessity denial'},
+	'99205': {'required_modifier': '25', 'reason': 'Frequent medical necessity denial'}
+	'99490{'required_modifier': '25', 'reason': 'Care plan not documented or provided to patient'}
+        '20610': {'required_icd': 'M17', 'reason': 'Specific ICD-10 link required'}
+    }
+    
+    cpt = claim_data.get('cpt')
+    if cpt in denial_watch_list:
+        pattern = denial_watch_list[cpt]
+        if not claim_data.get('modifier') == pattern['required_modifier']:
+            issues.append(f"WARNING: CPT {cpt} is frequently denied without Modifier {pattern['required_modifier']}. {pattern['reason']}.")
+
+    # 3. Medicare Enrollment Cross-Check
+    if claim_data['payer'] == 'MEDICARE' and npi not in master_enrollment:
+        issues.append("CRITICAL: Provider not enrolled in Medicare per internal master file.")
+
+    return {"is_valid": len(issues) == 0, "validation_log": issues}
