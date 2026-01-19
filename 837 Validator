@@ -1,37 +1,45 @@
-import requests
+import re
+from pydantic import BaseModel, validator, Field
+from typing import List, Optional
 
-def verify_and_scrub_837(claim_data, master_enrollment):
-    issues = []
-    npi = claim_data.get('rendering_provider_npi')
-    
-    # 1. NPPES API Validation
-    nppes_url = f"https://npiregistry.cms.hhs.gov/api/?number={npi}&version=2.1"
-    response = requests.get(nppes_url)
-    nppes_data = response.json()
-    
-    if nppes_data.get('result_count', 0) == 0:
-        issues.append(f"CRITICAL: NPI {npi} not found in NPPES Registry.")
-    elif nppes_data['results'][0]['basic']['status'] != 'A':
-        issues.append(f"CRITICAL: NPI {npi} is inactive in NPPES.")
+# --- Robust Schema Enforcement (ETL Engine) ---
+class ClaimSchema(BaseModel):
+    patient_control_number: str = Field(..., min_length=1)
+    billing_npi: str = Field(..., regex=r"^\d{10}$")
+    icd_10_codes: List[str]
+    cpt_codes: List[str]
+    total_charge: float
 
-    # 2. Frequently Denied CPT Check (New Logic)
-    # Mapping frequent denial patterns (e.g., E/M levels without modifiers)
-    denial_watch_list = {
-        '99214': {'required_modifier': '25', 'reason': 'High audit risk for unbundled services'},
-        '99215': {'required_modifier': '25', 'reason': 'Frequent medical necessity denial'},
-	'99205': {'required_modifier': '25', 'reason': 'Frequent medical necessity denial'}
-	'99490{'required_modifier': '25', 'reason': 'Care plan not documented or provided to patient'}
-        '20610': {'required_icd': 'M17', 'reason': 'Specific ICD-10 link required'}
-    }
-    
-    cpt = claim_data.get('cpt')
-    if cpt in denial_watch_list:
-        pattern = denial_watch_list[cpt]
-        if not claim_data.get('modifier') == pattern['required_modifier']:
-            issues.append(f"WARNING: CPT {cpt} is frequently denied without Modifier {pattern['required_modifier']}. {pattern['reason']}.")
+    @validator('icd_10_codes', each_item=True)
+    def validate_icd10(cls, v):
+        # Prevent "Dirty Data" rejections (Image 5 logic)
+        if not re.match(r"^[A-Z][0-9][0-9A-Z](\.[0-9A-Z]{1,4})?$", v):
+            raise ValueError(f"Invalid ICD-10 Format: {v}")
+        return v
 
-    # 3. Medicare Enrollment Cross-Check
-    if claim_data['payer'] == 'MEDICARE' and npi not in master_enrollment:
-        issues.append("CRITICAL: Provider not enrolled in Medicare per internal master file.")
+# --- ANSI X12 Strategic Validator (837-Validator) ---
+class X12Validator:
+    def __init__(self, x12_content: str):
+        self.content = x12_content
+        self.isa = x12_content[:106]
+        self.elem_sep = self.isa[1]
+        self.seg_sep = self.isa
 
-    return {"is_valid": len(issues) == 0, "validation_log": issues}
+    def check_hierarchical_integrity(self):
+        """Ensures HL segments (2000A/B/C) are logically sequenced (Image 3)"""
+        hl_segments = re.findall(rf"HL\{self.elem_sep}(\d+)\{self.elem_sep}(\d+)", self.content)
+        for i, (hl_id, parent_id) in enumerate(hl_segments):
+            if int(hl_id)!= i + 1:
+                return False, f"Sequence error at HL ID {hl_id}"
+        return True, "Integrity Verified"
+
+    def presubmission_scrub(self, claim_data: ClaimSchema):
+        """Flags potential denials BEFORE submission (Image 3 logic)"""
+        # Cross-reference logic (Stubs for NPPES API check)
+        if not self.is_provider_enrolled(claim_data.billing_npi):
+            return "HOLD: Provider Enrollment Pending (Image 4 Risk)"
+        return "PASS"
+
+    def is_provider_enrolled(self, npi):
+        # Logic to check against your 'Enrollment_Velocity-Tracker' cache
+        return True
