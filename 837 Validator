@@ -1,45 +1,107 @@
 import re
+import sqlite3
+from datetime import datetime
+from typing import List, Dict, Optional
 from pydantic import BaseModel, validator, Field
-from typing import List, Optional
 
-# --- Robust Schema Enforcement (ETL Engine) ---
-class ClaimSchema(BaseModel):
-    patient_control_number: str = Field(..., min_length=1)
-    billing_npi: str = Field(..., regex=r"^\d{10}$")
+# --- LAYER 1: ROBUST SCHEMA ENFORCEMENT (Data Integrity) ---
+class ClaimLineSchema(BaseModel):
+    lx_number: int
+    cpt_code: str = Field(..., regex=r"^\d{5}$")
+    modifier: Optional[str] = Field(None, regex=r"^[A-Z0-9]{2}$")
+    charge_amount: float
+    units: int = 1
+
+class ClaimSubmissionSchema(BaseModel):
+    """Ensures mandatory billing elements meet ANSI 5010 standards.[1, 2]"""
+    pcn: str = Field(..., alias="CLM01", min_length=1)
+    total_charge: float = Field(..., alias="CLM02")
+    billing_npi: str = Field(..., alias="NM109_85", regex=r"^\d{10}$")
+    rendering_npi: str = Field(..., alias="NM109_82", regex=r"^\d{10}$")
     icd_10_codes: List[str]
-    cpt_codes: List[str]
-    total_charge: float
+    service_lines: List
+    is_accident: bool = False
+    accident_date: Optional[str] = None
 
     @validator('icd_10_codes', each_item=True)
-    def validate_icd10(cls, v):
-        # Prevent "Dirty Data" rejections (Image 5 logic)
-        if not re.match(r"^[A-Z][0-9][0-9A-Z](\.[0-9A-Z]{1,4})?$", v):
+    def validate_icd10_format(cls, v):
+        """Prevents 'Dirty Data' rejections by enforcing regex and stripping decimals [Image 3, 42]."""
+        # ANSI 837 does not use decimals for ICD-10
+        clean_v = v.replace(".", "")
+        if not re.match(r"^[A-Z][0-9][0-9A-Z]([0-9A-Z]{1,4})?$", clean_v):
             raise ValueError(f"Invalid ICD-10 Format: {v}")
-        return v
+        return clean_v
 
-# --- ANSI X12 Strategic Validator (837-Validator) ---
-class X12Validator:
-    def __init__(self, x12_content: str):
-        self.content = x12_content
-        self.isa = x12_content[:106]
-        self.elem_sep = self.isa[1]
-        self.seg_sep = self.isa
+# --- LAYER 2: STRATEGIC VALIDATION ENGINE ---
+class X12Validator837:
+    def __init__(self, db_path="enrollment_cache.db"):
+        self.db_path = db_path
+        # Denial Watch List: CPTs requiring modifiers or specific ICD links
+        self.denial_watch_list = {
+            "99214": {"required_modifier": "25", "reason": "High audit risk; E/M requires modifier 25"},
+            "99215": {"required_modifier": "25", "reason": "High audit risk; E/M requires modifier 25"},
+            "20610": {"required_icd_prefix": "M17", "reason": "Medical necessity requires M17 prefix"}
+        }
 
-    def check_hierarchical_integrity(self):
-        """Ensures HL segments (2000A/B/C) are logically sequenced (Image 3)"""
-        hl_segments = re.findall(rf"HL\{self.elem_sep}(\d+)\{self.elem_sep}(\d+)", self.content)
+    def check_hierarchical_integrity(self, x12_content: str):
+        """SNIP Level 1: Ensures HL segments (2000A/B/C) are sequenced correctly [Image 3]."""
+        hl_segments = re.findall(r"HL\*(\d+)\*(\d+)?", x12_content)
         for i, (hl_id, parent_id) in enumerate(hl_segments):
             if int(hl_id)!= i + 1:
-                return False, f"Sequence error at HL ID {hl_id}"
-        return True, "Integrity Verified"
+                return False, f"SNIP 1 ERROR: Hierarchical sequence break at HL ID {hl_id}"
+        return True, "Hierarchical Integrity Verified"
 
-    def presubmission_scrub(self, claim_data: ClaimSchema):
-        """Flags potential denials BEFORE submission (Image 3 logic)"""
-        # Cross-reference logic (Stubs for NPPES API check)
-        if not self.is_provider_enrolled(claim_data.billing_npi):
-            return "HOLD: Provider Enrollment Pending (Image 4 Risk)"
-        return "PASS"
+    def verify_credentialing_gate(self, npi: str):
+        """Strategic Gate: Blocks claims for unenrolled providers [Image 3, 4]."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT pecos_status, days_in_pipeline FROM enrollment_audit WHERE npi =?", (npi,))
+                row = cursor.fetchone()
+                
+                if not row:
+                    return "CRITICAL: NPI not found in Velocity Tracker. Enrollment unknown."
+                
+                status, days = row
+                if status!= "Approved":
+                    return f"HOLD: Provider status is '{status}' ({days} days in pipe). Claim is unbillable."
+                return "PASS"
+        except Exception:
+            return "GATE ERROR: Could not verify enrollment database."
 
-    def is_provider_enrolled(self, npi):
-        # Logic to check against your 'Enrollment_Velocity-Tracker' cache
-        return True
+    def strategic_scrub(self, claim: ClaimSubmissionSchema) -> Dict:
+        """Executes SNIP Level 3 (Balancing) and Level 4 (Situational) checks ."""
+        log =
+        
+        # 1. Credentialing Hard-Stop
+        cred_status = self.verify_credentialing_gate(claim.rendering_npi)
+        if "HOLD" in cred_status or "CRITICAL" in cred_status:
+            log.append(cred_status)
+
+        # 2. SNIP Level 3: Financial Balancing 
+        line_total = sum(line.charge_amount for line in claim.service_lines)
+        if abs(line_total - claim.total_charge) > 0.01:
+            log.append(f"SNIP 3 ERROR: Service line sum (${line_total}) does not balance with CLM02 (${claim.total_charge})")
+
+        # 3. SNIP Level 4: Situational Rules 
+        if claim.is_accident and not claim.accident_date:
+            log.append("SNIP 4 ERROR: Accident indicator 'Y' requires an accident date (DTP*439).")
+
+        # 4. Denial Pattern Matching: CPT Watch List
+        for line in claim.service_lines:
+            if line.cpt_code in self.denial_watch_list:
+                rule = self.denial_watch_list[line.cpt_code]
+                
+                # Check for Modifier 25 on E/M codes
+                if "required_modifier" in rule and line.modifier!= rule["required_modifier"]:
+                    log.append(f"WARNING: CPT {line.cpt_code} - {rule['reason']}")
+                
+                # Check for ICD specificity (Medical Necessity)
+                if "required_icd_prefix" in rule:
+                    if not any(icd.startswith(rule["required_icd_prefix"]) for icd in claim.icd_10_codes):
+                        log.append(f"WARNING: CPT {line.cpt_code} - {rule['reason']}")
+
+        return {
+            "is_valid": len() == 0,
+            "validation_log": log
+        }
